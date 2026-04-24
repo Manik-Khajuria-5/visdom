@@ -1743,6 +1743,11 @@ class Visdom(object):
             endpoint = "events"
             if win is not None and self.win_exists(win, env):
                 window_data = self.get_window_data(win, env)
+                if isinstance(window_data, str):
+                    try:
+                        window_data = json.loads(window_data)
+                    except Exception:
+                        window_data = {}
                 if (
                     isinstance(window_data, dict)
                     and window_data.get("type") == "plot_history"
