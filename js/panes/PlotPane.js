@@ -65,7 +65,12 @@ var PlotPane = (props) => {
     if (!plotElement) return;
 
     const resizeObserver = new ResizeObserver(() => {
-      if (plotElement._fullLayout && isDisplayed(plotElement)) {
+      if (
+        plotElement._fullLayout &&
+        isDisplayed(plotElement) &&
+        plotElement.offsetWidth > 50 &&
+        plotElement.offsetHeight > 50
+      ) {
         Plotly.Plots.resize(plotElement);
       }
     });
@@ -174,7 +179,13 @@ var PlotPane = (props) => {
       linkText: 'Edit',
     }).then(() => {
       const plotElement = plotlyRef.current;
-      if (plotElement && plotElement._fullLayout && isDisplayed(plotElement)) {
+      if (
+        plotElement &&
+        plotElement._fullLayout &&
+        isDisplayed(plotElement) &&
+        plotElement.offsetWidth > 50 &&
+        plotElement.offsetHeight > 50
+      ) {
         Plotly.Plots.resize(plotElement);
       }
     });
