@@ -116,8 +116,6 @@ from visdom.utils.shared_utils import NanSafeEncoder
 
 
 
-
-
 def loadfile(filename):
     assert os.path.isfile(filename), "could not find file %s" % filename
     fileobj = open(filename, "rb")
