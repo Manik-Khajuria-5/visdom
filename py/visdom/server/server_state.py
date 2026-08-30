@@ -105,6 +105,10 @@ class StateAccessorsMixin:
     def live_updates(self):
         return self.server_state.live_updates
 
+    @property
+    def storage_executor(self):
+        return self.server_state.storage_executor
+
     def mark_dirty(self, eid):
         """Mark an environment for persistence through the shared state."""
         return self.server_state.mark_dirty(eid)
@@ -173,6 +177,12 @@ class ServerState:
         self.dirty_envs = Counter()
         self.saving_envs = set()
         self.autosave = None
+        # Disk work is handed to one worker thread rather than run on the loop.
+        # A single worker keeps the writes serialized, so two saves of the same
+        # environment cannot interleave and leave a half-written file behind.
+        self.storage_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="visdom-storage"
+        )
         # Set by the application once the handlers it drives can be imported;
         # a queue built here would need experiments_handler, which needs the
         # handlers that need this module.
@@ -186,7 +196,13 @@ class ServerState:
     def set_layouts(self, layouts):
         self._layouts = layouts
 
-    def save_layouts(self):
+    def save_layouts(self, layouts=None):
+        """Persist the layout blob, defaulting to the one held in memory.
+
+        A caller writing from the storage worker passes the snapshot it took on
+        the loop, so the write records the layouts as they were when it was
+        scheduled rather than whatever a later edit has since installed.
+        """
         if self.env_path is None:
             warn_once(
                 "Saving and loading to disk has no effect when running with "
@@ -194,7 +210,7 @@ class ServerState:
                 RuntimeWarning,
             )
             return
-        self.storage.save_layouts(self._layouts)
+        self.storage.save_layouts(self._layouts if layouts is None else layouts)
 
     def _load_layouts(self):
         if self.env_path is None:

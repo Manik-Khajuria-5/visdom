@@ -17,11 +17,15 @@ is in place so a future refactor cannot silently bypass the backend.
 Nothing here speaks HTTP -- the handlers are driven through ``wrap_func`` and
 ``on_message`` with a ``FakeHandler`` -- so these are plain functions on the
 shared fixtures, and ``SpyStore`` stands in wherever a call has to be observed.
+The entry points that touch disk -- the wrap functions and ``on_message``
+alike -- are coroutines, so those calls go through ``asyncio.run``: the loop is
+what hands their work to the storage executor.
 """
 
 import asyncio
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -45,6 +49,7 @@ from visdom.utils.server_utils import (
     push_deleted,
 )
 
+from testutils import open_sub
 from testutils.fakes import FakeHandler, SpyStore
 from testutils.payloads import env_payload
 
@@ -65,7 +70,7 @@ def test_save_routes_through_storage(app, spy_store):
     """SaveHandler persists via storage.save_envs rather than writing files."""
     handler = FakeHandler(state=app.state, storage=spy_store)
 
-    SaveHandler.wrap_func(handler, {"data": ["main"]})
+    asyncio.run(SaveHandler.wrap_func(handler, {"data": ["main"]}))
 
     assert spy_store.calls["save_envs"] == [["main"]]
     assert "main" in handler.json_body()
@@ -188,8 +193,10 @@ def test_socket_delete_routes_through_storage(spy_store, env_path, inline_execut
         readonly=False,
     )
 
-    AnySocketHandlerOrWrapper.on_message(
-        handler, json.dumps({"cmd": "delete_env", "eid": "expt"})
+    asyncio.run(
+        AnySocketHandlerOrWrapper.on_message(
+            handler, json.dumps({"cmd": "delete_env", "eid": "expt"})
+        )
     )
 
     assert spy_store.calls["delete_env"] == ["expt"]
@@ -392,3 +399,152 @@ def test_ensure_env_loaded_skips_an_env_already_in_memory(app, spy_store):
     asyncio.run(ensure_env_loaded(handler, "warm"))
 
     assert spy_store.calls["load_env"] == []
+
+
+# -- Socket commands and the loop thread --------------------------------------
+
+
+def dispatch(handler, **msg):
+    """Run one socket command to completion, reporting the loop's thread.
+
+    ``on_message`` is a coroutine, so a loop has to drive it; the name of the
+    thread that loop ran on is what the assertions below compare the store's
+    calls against.
+    """
+    loop_thread = {}
+
+    async def main():
+        loop_thread["name"] = threading.current_thread().name
+        await AnySocketHandlerOrWrapper.on_message(handler, json.dumps(msg))
+
+    asyncio.run(main())
+    return loop_thread["name"]
+
+
+def assert_off_loop(store, loop_thread, methods):
+    """Every call to ``methods`` happened somewhere other than the loop."""
+    ran = [(m, t) for m, t in store.threads if m in methods]
+    assert ran, f"expected {methods} to be called, saw {store.threads}"
+    assert [t for _m, t in ran if t == loop_thread] == []
+
+
+def socket_handler(spy_store, env_path, state):
+    return FakeHandler(
+        state=state, storage=spy_store, env_path=env_path, readonly=False
+    )
+
+
+def test_socket_close_writes_the_undo_stack_off_the_loop(spy_store, env_path):
+    """Closing a pane records it for undo, and that write is not on the loop."""
+    handler = socket_handler(spy_store, env_path, {"expt": env_payload()})
+
+    loop_thread = dispatch(handler, cmd="close", eid="expt", data="win_0")
+
+    assert spy_store.calls["save_undo"] == ["expt"]
+    assert_off_loop(spy_store, loop_thread, {"load_undo", "save_undo"})
+
+
+def test_socket_close_reports_the_depth_it_was_just_told(spy_store, env_path):
+    """The undo count rides back on the push, so the stack is read once."""
+    handler = socket_handler(spy_store, env_path, {"expt": env_payload()})
+    sub = handler.add_sub(eid="expt")
+
+    dispatch(handler, cmd="close", eid="expt", data="win_0")
+
+    assert spy_store.calls["load_undo"] == ["expt"]
+    assert sub.last("undo_state")["count"] == 1
+
+
+def test_socket_undo_reads_the_stack_off_the_loop(spy_store, env_path):
+    """Undo pops from disk, and reports what is left, without the loop waiting."""
+    push_deleted(spy_store, "expt", "win_1", {"id": "win_1"})
+    handler = socket_handler(spy_store, env_path, {"expt": env_payload()})
+    sub = handler.add_sub(eid="expt")
+    spy_store.threads.clear()
+
+    loop_thread = dispatch(handler, cmd="undo", eid="expt")
+
+    assert "win_1" in handler.state["expt"]["jsons"]
+    assert sub.last("undo_state")["count"] == 0
+    assert_off_loop(spy_store, loop_thread, {"load_undo", "clear_undo"})
+
+
+def test_socket_delete_env_removes_the_env_file_off_the_loop(spy_store, env_path):
+    """The env file goes to the worker; its undo history is dropped on the loop.
+
+    Clearing the undo stack is a small, in-memory-then-unlink step that has to
+    happen before the removal is queued, so the delete the worker runs cannot
+    be overtaken by an undo write scheduled behind it.
+    """
+    spy_store.save_env("expt", env_payload())
+    push_deleted(spy_store, "expt", "win_0", {"id": "win_0"})
+    handler = socket_handler(spy_store, env_path, {"expt": env_payload()})
+    spy_store.threads.clear()
+
+    loop_thread = dispatch(handler, cmd="delete_env", eid="expt")
+
+    assert spy_store.calls["delete_env"] == ["expt"]
+    assert count_deleted(spy_store, "expt") == 0
+    assert_off_loop(spy_store, loop_thread, {"delete_env"})
+
+
+def test_socket_save_writes_the_new_env_off_the_loop(spy_store, env_path):
+    """Saving under a new id persists the copy without blocking the loop."""
+    handler = socket_handler(spy_store, env_path, {"expt": env_payload()})
+
+    loop_thread = dispatch(handler, cmd="save", eid="copy", prev_eid="expt", data={})
+
+    assert spy_store.calls["save_env"] == ["copy"]
+    assert_off_loop(spy_store, loop_thread, {"save_env"})
+
+
+def test_socket_save_reads_a_cold_source_env_off_the_loop(spy_store, env_path):
+    """A cold source is materialised first, so the copy has data to write.
+
+    Copying the ``LazyEnvData`` itself carried the source's id rather than its
+    panes, leaving the new env answering to the file it was copied from.
+    """
+    spy_store.save_env("cold", env_payload("w1"))
+    handler = socket_handler(
+        spy_store, env_path, {"cold": LazyEnvData(spy_store, "cold")}
+    )
+
+    loop_thread = dispatch(handler, cmd="save", eid="copy", prev_eid="cold", data={})
+
+    assert_off_loop(spy_store, loop_thread, {"load_env"})
+    assert spy_store.load_env("copy")["jsons"] == env_payload("w1")["jsons"]
+
+
+def test_socket_save_layouts_writes_the_snapshot_off_the_loop(app_factory):
+    """Layouts are written on the worker, from the blob read on the loop.
+
+    The spy has to be the store the app builds for itself: ``ServerState``
+    takes its own reference at construction, so a store swapped in afterwards
+    would be observed by nobody.
+    """
+    with mock.patch("visdom.server.app.JSONStore", SpyStore):
+        app = app_factory()
+    spy_store = app.storage
+    sub = open_sub(app)
+    loop_thread = {}
+
+    async def main():
+        loop_thread["name"] = threading.current_thread().name
+        await sub.on_message(json.dumps({"cmd": "save_layouts", "data": '[["v", {}]]'}))
+
+    asyncio.run(main())
+
+    assert app.layouts == '[["v", {}]]'
+    assert spy_store.calls["save_layouts"] == ['[["v", {}]]']
+    assert_off_loop(spy_store, loop_thread["name"], {"save_layouts"})
+
+
+def test_save_layouts_writes_what_it_was_handed(app_factory):
+    """The worker writes the snapshot it was given, not a later edit."""
+    with mock.patch("visdom.server.app.JSONStore", SpyStore):
+        app = app_factory()
+    app.layouts = '[["newer", {}]]'
+
+    app.save_layouts('[["older", {}]]')
+
+    assert app.storage.calls["save_layouts"] == ['[["older", {}]]']

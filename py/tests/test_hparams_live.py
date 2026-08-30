@@ -33,7 +33,6 @@ import tornado.web
 from visdom.experiments import ExperimentStore, LiveUpdateQueue, resolve_targets
 from visdom.server.app import Application
 
-
 def hparams_window(mode, query=None, env_ids=None):
     """A stored hparams window, as the pane endpoints write it."""
     return {

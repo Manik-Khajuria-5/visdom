@@ -21,6 +21,7 @@ instead (see ``_run_storage_inline``) and read the result off that future, which
 keeps the assertions from racing a thread pool.
 """
 
+import asyncio
 import json
 import tempfile
 import types
@@ -403,8 +404,10 @@ class TestDeleteOutlastsAQueuedSave(unittest.TestCase):
     def test_a_socket_delete_survives_the_save_queued_before_it(self):
         self.queue_autosave()
 
-        AnySocketHandlerOrWrapper.on_message(
-            self.handler, json.dumps({"cmd": "delete_env", "eid": "expt"})
+        asyncio.run(
+            AnySocketHandlerOrWrapper.on_message(
+                self.handler, json.dumps({"cmd": "delete_env", "eid": "expt"})
+            )
         )
         self.run_queued()
 
@@ -506,7 +509,9 @@ class TestSocketCommandsMarkTheirWrites(unittest.TestCase):
         self._tmp.cleanup()
 
     def send(self, **msg):
-        AnySocketHandlerOrWrapper.on_message(self.handler, json.dumps(msg))
+        # ``on_message`` is a coroutine now that the commands hand their disk
+        # work to the storage worker, so a loop has to drive it to completion.
+        asyncio.run(AnySocketHandlerOrWrapper.on_message(self.handler, json.dumps(msg)))
 
     def register(self, win="win_0"):
         register_window(self.handler, window(window_args(win=win)), "main")
