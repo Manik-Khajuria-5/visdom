@@ -105,10 +105,6 @@ class StateAccessorsMixin:
     def live_updates(self):
         return self.server_state.live_updates
 
-    @property
-    def storage_executor(self):
-        return self.server_state.storage_executor
-
     def mark_dirty(self, eid):
         """Mark an environment for persistence through the shared state."""
         return self.server_state.mark_dirty(eid)
@@ -177,12 +173,7 @@ class ServerState:
         self.dirty_envs = Counter()
         self.saving_envs = set()
         self.autosave = None
-        # Disk work is handed to one worker thread rather than run on the loop.
-        # A single worker keeps the writes serialized, so two saves of the same
-        # environment cannot interleave and leave a half-written file behind.
-        self.storage_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="visdom-storage"
-        )
+        self._storage_shut_down = False
         # Set by the application once the handlers it drives can be imported;
         # a queue built here would need experiments_handler, which needs the
         # handlers that need this module.
@@ -326,7 +317,16 @@ class ServerState:
         Draining next stops an already-queued write from landing after the
         final save and putting a stale env back on disk. The final save covers
         whatever was still marked dirty, so the marks are cleared with it.
+
+        Idempotent: the graceful shutdown calls this, and the ``atexit`` hook
+        that covers a teardown which never reaches it calls it again. A second
+        pass must not re-run ``save_all`` -- the executor is already gone, so
+        anything written after the first pass could only be state the process
+        never served.
         """
+        if self._storage_shut_down:
+            return
+        self._storage_shut_down = True
         self.stop_autosave()
         self.storage_executor.shutdown(wait=True)
         self.storage.save_all(self.state)
