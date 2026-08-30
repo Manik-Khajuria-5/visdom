@@ -16,6 +16,7 @@ import pytest
 from visdom.data_model.json_store import JSONStore
 from visdom.utils.server_utils import (
     LazyEnvData,
+    create_args_for_append,
     escape_eid,
     extract_eid,
     hash_password,
@@ -131,6 +132,25 @@ def test_hash_password_full_login_flow():
     stored = hash_password(client_hash)
     salt = stored.split("$")[0]
     assert hash_password(client_hash, salt=salt) == stored
+
+
+# ------------------------------------------------- create_args_for_append ----
+
+
+def test_layout_create_fills_in_the_empty_layout_an_append_sends():
+    args = {"data": [], "layout": {}, "layout_create": {"title": "t"}}
+    assert create_args_for_append(args)["layout"] == {"title": "t"}
+
+
+def test_a_real_layout_outranks_layout_create():
+    """A caller that sends both meant the one it labelled ``layout``."""
+    args = {"layout": {"title": "explicit"}, "layout_create": {"title": "fallback"}}
+    assert create_args_for_append(args)["layout"] == {"title": "explicit"}
+
+
+def test_layout_defaults_to_empty_when_neither_key_is_present():
+    """``window()`` indexes ``args["layout"]``, so the key has to exist."""
+    assert create_args_for_append({"data": []})["layout"] == {}
 
 
 # --------------------------------------------------------------- stringify ----
